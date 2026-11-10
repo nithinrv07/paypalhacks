@@ -1,0 +1,76 @@
+{
+  "chosen": "logistic_regression",
+  "models": {
+    "logistic_regression": {
+      "brier": 0.01457,
+      "auc": 0.8466,
+      "calibration": [
+        {
+          "predicted": 0.011,
+          "actual": 0.014,
+          "n": 103930
+        },
+        {
+          "predicted": 0.124,
+          "actual": 0.133,
+          "n": 1334
+        }
+      ]
+    },
+    "gradient_boosting": {
+      "brier": 0.01548,
+      "auc": 0.8617,
+      "calibration": [
+        {
+          "predicted": 0.007,
+          "actual": 0.012,
+          "n": 101811
+        },
+        {
+          "predicted": 0.14,
+          "actual": 0.111,
+          "n": 2215
+        },
+        {
+          "predicted": 0.24,
+          "actual": 0.138,
+          "n": 708
+        },
+        {
+          "predicted": 0.339,
+          "actual": 0.112,
+          "n": 215
+        },
+        {
+          "predicted": 0.44,
+          "actual": 0.084,
+          "n": 154
+        },
+        {
+          "predicted": 0.544,
+          "actual": 0.051,
+          "n": 59
+        },
+        {
+          "predicted": 0.768,
+          "actual": 0.0,
+          "n": 33
+        }
+      ]
+    }
+  },
+  "climatology_brier": 0.02781,
+  "train_years": "2010-2022",
+  "test_years": [
+    2023,
+    2024
+  ],
+  "rows_train": 683712,
+  "rows_test": 105264,
+  "points": [
+    "Besant Nagar",
+    "Anna University",
+    "Tambaram",
+    "Anna Nagar"
+  ]
+}

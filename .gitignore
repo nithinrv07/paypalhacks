@@ -1,0 +1,13 @@
+node_modules/
+.next/
+__pycache__/
+*.pyc
+.env
+backend/eventrain.db
+backend/server.log
+backend/ml/data/
+backend/ml/train.log
+*.log
+*.db
+.vercel/
+.claude/

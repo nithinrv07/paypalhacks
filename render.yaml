@@ -1,0 +1,25 @@
+# Render Blueprint for the EventRain Cover API (FastAPI).
+# Render dashboard -> New -> Blueprint -> pick this repo. Add PayPal Sandbox keys
+# under Environment afterwards (leave empty to keep mock mode).
+services:
+  - type: web
+    name: eventrain-cover-api
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/config
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_CLIENT_SECRET
+        sync: false
+      - key: PAYPAL_WEBHOOK_ID
+        sync: false
+      - key: INR_PER_USD
+        value: "88"
+      - key: DEMO_REPLAY_SECONDS
+        value: "60"

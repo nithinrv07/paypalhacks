@@ -1,0 +1,54 @@
+@import "tailwindcss";
+
+/* Monsoon ink + marigold: night sky over a festival lawn */
+@theme inline {
+  --color-ink: #0b1e2a;
+  --color-ink-2: #12303f;
+  --color-ink-3: #1d4557;
+  --color-mist: #e8f1f4;
+  --color-cloud: #f6f9fa;
+  --color-slate: #5b7380;
+  --color-marigold: #f2a93b;
+  --color-marigold-deep: #d88412;
+  --color-rain: #5cc2e6;
+  --color-leaf: #2f9e6e;
+  --color-alert: #d9534f;
+  --font-sans: var(--font-body);
+  --font-display: var(--font-display);
+}
+
+body {
+  background: var(--color-cloud);
+  color: var(--color-ink);
+}
+
+/* falling rain for hero sections */
+.rain {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+.rain i {
+  position: absolute;
+  top: -20%;
+  width: 1px;
+  height: 18%;
+  background: linear-gradient(to bottom, transparent, rgba(92, 194, 230, 0.55));
+  animation: fall linear infinite;
+}
+@keyframes fall {
+  to {
+    transform: translateY(700%);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rain i {
+    animation: none;
+    display: none;
+  }
+}
+
+.leaflet-container {
+  font: inherit;
+}
