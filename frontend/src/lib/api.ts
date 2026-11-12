@@ -12,8 +12,20 @@ export type Config = {
   demo_replay_seconds: number;
 };
 
+export type Slot = { start: string; end: string; premium_inr: number; probability: number };
+export type Suggestion = Slot & { saving_inr: number; kind: "date" | "time" };
+export type Tier = { mm: number; fraction: number; probability?: number };
+export type PayoutMode = "fixed" | "graduated";
+export type Split = { name: string; email: string; pct: number };
+export type Alert = { id: string; time: string; kind: "info" | "warn" | "trigger"; text: string };
+
 export type Quote = {
   probability: number;
+  expected_payout_fraction: number;
+  payout_mode: PayoutMode;
+  tiers: Tier[];
+  suggestions?: Suggestion[];
+  hourly_risk?: (Slot & { hour: number })[];
   premium_inr: number;
   payout_inr: number;
   threshold_mm: number;
@@ -44,6 +56,7 @@ export type Live = {
   threshold_mm: number;
   starts_in_s?: number;
   series: { time: string; rain_mm: number; cumulative: number; forecast?: boolean }[];
+  alerts?: Alert[];
 };
 
 export type Decision = {
@@ -54,13 +67,16 @@ export type Decision = {
   spread_mm: number;
   tolerance_mm: number;
   window: [string, string];
+  earned_fraction?: number;
+  disputed_fraction?: number;
+  sources?: Record<string, string>;
   checked_at: string;
   demo_replay: boolean;
 };
 
 export type Payment = { type: string; paypal_id: string | null; amount: number; currency: string; status: string; created_at: string };
 
-export type Status = "QUOTED" | "ACTIVE" | "TRIGGERED" | "PAID" | "EXPIRED" | "FLAGGED";
+export type Status = "QUOTED" | "ACTIVE" | "TRIGGERED" | "PAID" | "EXPIRED" | "FLAGGED" | "CANCELLED";
 
 export type Policy = {
   id: number;
@@ -87,6 +103,12 @@ export type Policy = {
   decision: Decision | null;
   payments: Payment[];
   live: Live | null;
+  payout_mode: PayoutMode;
+  paid_fraction: number;
+  splits: Split[];
+  ladder: Tier[];
+  can_cancel: boolean;
+  refund_inr: number;
 };
 
 export async function api<T>(path: string, body?: unknown): Promise<T> {

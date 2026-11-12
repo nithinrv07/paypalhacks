@@ -48,6 +48,19 @@ Without keys, PayPal runs in **mock mode**, so the whole flow still works. To us
 
 Sandbox charges in USD; the app shows ₹ (`INR_PER_USD=88`).
 
+## Features
+
+| Feature | What it does |
+|---|---|
+| **Graduated payouts** | Choose "Graduated": 25% at 5 mm, 50% at 10 mm, 100% at 20 mm. Priced from the model's chance at each level. If the two sources disagree, the level both confirm is paid at once and only the rest goes to review. |
+| **Reschedule suggester** | The quote tries ±3 days and other start times, then offers up to 3 cheaper, lower-risk slots (one click to apply), plus a rain-risk-by-start-hour strip. |
+| **Auto-split payouts** | Up to 5 payees (organiser, caterer, decorator…) with % shares. One PayPal Payouts batch pays everyone. |
+| **Proof pack** | `/api/policies/{id}/proof` (printable) and `proof.json`: hourly readings from both sources, the exact Open-Meteo URLs to re-check them, decision logic, PayPal trail and a SHA-256 fingerprint. |
+| **Live rain alerts** | Toasts, a feed and optional browser notifications at 50% and 80% of the payout level, at each level crossed, for heavy bursts, and for wet forecast hours. |
+| **Cancel & refund** | Cancel at least 24 h before the event (demo: before the replay) to get the premium minus ₹99 back through the PayPal Refunds API. |
+| **WhatsApp share** | Share the cover or the result with your team in one tap. |
+| **Demo weather** | Rainy (15 Nov 2023), Dry (26 Nov 2023) or Live. Events today or tomorrow always use live weather for their real hours. |
+
 ## How the AI works
 
 **Pricing** (`backend/ml/train.py`, `backend/app/pricing.py`)

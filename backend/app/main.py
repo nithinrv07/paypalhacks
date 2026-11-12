@@ -5,6 +5,7 @@ Run:  uvicorn app.main:app --reload --port 8000   (from the backend folder)
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -13,10 +14,10 @@ from html import escape
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, EmailStr, Field, model_validator
 
-from . import config, db, pricing, trigger
+from . import config, db, pricing, tiers, trigger
 from .paypal import paypal
 
 
@@ -54,6 +55,7 @@ class QuoteIn(BaseModel):
     payout_inr: float
     demo: bool = False
     demo_scenario: Literal["rain", "dry", "live"] = "rain"
+    payout_mode: Literal["fixed", "graduated"] = "fixed"
 
     @model_validator(mode="after")
     def rules(self):
@@ -71,12 +73,25 @@ class QuoteIn(BaseModel):
         return self
 
 
+class Split(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+    email: EmailStr
+    pct: float = Field(gt=0, le=100)
+
+
 class PolicyIn(QuoteIn):
     venue: str = Field(min_length=2, max_length=120)
     event_name: str = Field(min_length=2, max_length=120)
     name: str = Field(min_length=2, max_length=80)
     email: EmailStr
     paypal_email: EmailStr
+    splits: list[Split] = Field(default_factory=list, max_length=5)
+
+    @model_validator(mode="after")
+    def split_rules(self):
+        if self.splits and abs(sum(x.pct for x in self.splits) - 100) > 0.01:
+            raise ValueError("Payout split percentages must add up to 100")
+        return self
 
 
 class CaptureIn(BaseModel):
@@ -100,7 +115,7 @@ def get_config():
 @app.post("/api/quote")
 def quote(q: QuoteIn):
     try:
-        return pricing.quote(q.lat, q.lon, q.start, q.end, q.threshold_mm, q.payout_inr)
+        return pricing.quote(q.lat, q.lon, q.start, q.end, q.threshold_mm, q.payout_inr, q.payout_mode, q.demo)
     except Exception as e:
         raise HTTPException(502, f"Could not price this event: {e}")
 
@@ -117,14 +132,17 @@ def create_policy(p: PolicyIn):
 
     # Demo events today or tomorrow always use the live weather for their real hours
     scenario = "live" if p.demo and 0 <= (p.start.date() - datetime.now().date()).days <= 1 else p.demo_scenario
-    q = pricing.quote(p.lat, p.lon, p.start, p.end, p.threshold_mm, p.payout_inr)  # price on the server, never trust client
+    q = pricing.quote(p.lat, p.lon, p.start, p.end, p.threshold_mm, p.payout_inr, p.payout_mode, p.demo,
+                      suggest=False)  # price on the server, never trust the client
+    splits = [x.model_dump() for x in p.splits] or [{"name": p.name, "email": p.paypal_email, "pct": 100.0}]
     uid = db.run("INSERT INTO users (name, email, paypal_email) VALUES (?,?,?)", p.name, p.email, p.paypal_email)
     eid = db.run("INSERT INTO events (user_id, name, venue, lat, lon, start_time, end_time) VALUES (?,?,?,?,?,?,?)",
                  uid, p.event_name, p.venue, p.lat, p.lon, p.start.isoformat(), p.end.isoformat())
     pid = db.run("""INSERT INTO policies (event_id, threshold_mm, payout_amount, premium, probability, status,
-                    quote_json, demo, demo_scenario, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                 eid, p.threshold_mm, p.payout_inr, q["premium_inr"], q["probability"], "QUOTED",
-                 json.dumps(q), int(p.demo), scenario, db.now(), db.now())
+                    quote_json, demo, demo_scenario, payout_mode, splits_json, created_at, updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 eid, q["threshold_mm"], p.payout_inr, q["premium_inr"], q["probability"], "QUOTED",
+                 json.dumps(q), int(p.demo), scenario, p.payout_mode, json.dumps(splits), db.now(), db.now())
     return {"id": pid}
 
 
@@ -145,8 +163,22 @@ def get_policy(pid: int):
                               "WHERE policy_id = ? ORDER BY id", pid)
     out["premium_usd"] = round(p["premium"] / config.INR_PER_USD, 2)
     out["payout_usd"] = round(p["payout_amount"] / config.INR_PER_USD, 2)
-    out["live"] = trigger.live(p) if p["status"] != "QUOTED" else None
+    out["live"] = trigger.live(p) if p["status"] not in ("QUOTED", "CANCELLED") else None
+    out["splits"] = trigger.splits(p)
+    out.pop("splits_json", None)
+    out["ladder"] = [{"mm": mm, "fraction": f} for mm, f in tiers.ladder(p.get("payout_mode"), p["threshold_mm"])]
+    out["can_cancel"] = _can_cancel(p)
+    out["refund_inr"] = max(0, p["premium"] - config.PLATFORM_FEE_INR)
     return out
+
+
+def _can_cancel(p: dict) -> bool:
+    """Cancel before the cut-off (or, for demos, before the replay starts)."""
+    if p["status"] != "ACTIVE":
+        return False
+    if p["demo"]:
+        return not p["replay_started_at"]
+    return datetime.now() < datetime.fromisoformat(p["start_time"]) - timedelta(hours=config.CUTOFF_HOURS)
 
 
 @app.post("/api/policies/{pid}/order")
@@ -193,6 +225,116 @@ def demo_start(pid: int):
     return get_policy(pid)
 
 
+@app.post("/api/policies/{pid}/cancel")
+def cancel(pid: int):
+    """Cancel for non-weather reasons: refund the premium minus the platform fee
+    through the PayPal Refunds API."""
+    p = _policy_or_404(pid)
+    if not _can_cancel(p):
+        raise HTTPException(409, f"Cover can only be cancelled while active and at least "
+                                 f"{config.CUTOFF_HOURS:g} hours before the event")
+    prem = db.one("SELECT paypal_id FROM payments WHERE policy_id = ? AND type = 'PREMIUM'", pid)
+    refund_inr = max(0, p["premium"] - config.PLATFORM_FEE_INR)
+    usd = round(refund_inr / config.INR_PER_USD, 2)
+    try:
+        res = paypal.refund(prem["paypal_id"], usd, f"EventRain Cover #{pid} cancelled")
+    except Exception as e:
+        raise HTTPException(502, f"PayPal refund failed: {e}")
+    db.run("INSERT INTO payments (policy_id, type, paypal_id, amount, currency, status, raw, created_at) "
+           "VALUES (?,?,?,?,?,?,?,?)", pid, "REFUND", res["id"], usd, "USD", res["status"],
+           json.dumps(res.get("raw", {})), db.now())
+    db.set_status(pid, "CANCELLED", summary=f"Cancelled before the event. {trigger.inr(refund_inr)} was refunded to "
+                                            f"your PayPal (premium minus the {trigger.inr(config.PLATFORM_FEE_INR)} fee).")
+    return get_policy(pid)
+
+
+def _proof(pid: int) -> dict:
+    p = _policy_or_404(pid)
+    if not p["decision_json"]:
+        raise HTTPException(409, "The proof pack is ready once the weather has been checked")
+    decision = json.loads(p["decision_json"])
+    rows = db.all_("SELECT source, timestamp, rain_mm FROM weather_readings WHERE policy_id = ? AND source != 'replay' "
+                   "ORDER BY source, timestamp", pid)
+    readings: dict[str, list] = {}
+    for r in rows:
+        readings.setdefault(r["source"], []).append({"time": r["timestamp"], "rain_mm": r["rain_mm"]})
+    payouts = db.all_("SELECT type, paypal_id, amount, currency, status, raw, created_at FROM payments "
+                      "WHERE policy_id = ? ORDER BY id", pid)
+    for x in payouts:
+        raw_text = x.pop("raw") or ""
+        try:
+            raw = json.loads(raw_text) if raw_text.startswith("{") else {}
+        except ValueError:
+            raw = {}
+        x["recipients"] = raw.get("items")
+    evidence = {"policy_id": pid, "venue": p["venue"], "lat": p["lat"], "lon": p["lon"],
+                "event_window": [p["start_time"], p["end_time"]], "weather_window": decision["window"],
+                "payout_mode": p.get("payout_mode") or "fixed",
+                "ladder": decision.get("ladder") or [[p["threshold_mm"], 1.0]],
+                "cover_inr": p["payout_amount"], "readings": readings, "decision": decision}
+    canonical = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+    return {**evidence, "payments": payouts, "sha256": hashlib.sha256(canonical.encode()).hexdigest(),
+            "generated_at": db.now(),
+            "how_to_verify": "Open each URL in decision.sources: the hourly precipitation for the weather window "
+                             "must match readings. Recompute sha256 over the evidence fields (sorted keys, no spaces)."}
+
+
+@app.get("/api/policies/{pid}/proof.json")
+def proof_json(pid: int):
+    return JSONResponse(_proof(pid), headers={"Content-Disposition": f'attachment; filename="eventrain-proof-{pid}.json"'})
+
+
+@app.get("/api/policies/{pid}/proof", response_class=HTMLResponse)
+def proof_page(pid: int):
+    pf = _proof(pid)
+    d = pf["decision"]
+    e = lambda x: escape(str(x))
+    srcs = list(pf["readings"])
+    times = sorted({r["time"] for rows in pf["readings"].values() for r in rows})
+    look = {s: {r["time"]: r["rain_mm"] for r in pf["readings"][s]} for s in srcs}
+    run = {s: 0.0 for s in srcs}
+    body_rows = []
+    for t in times:
+        cells = []
+        for s in srcs:
+            v = look[s].get(t, 0.0)
+            run[s] += v
+            cells.append(f"<td>{v:.2f}</td><td class=m>{run[s]:.2f}</td>")
+        body_rows.append(f"<tr><td>{e(t.replace('T', ' '))}</td>{''.join(cells)}</tr>")
+    head = "".join(f"<th>{e(s)}<br><small>mm / hour</small></th><th class=m>running total</th>" for s in srcs)
+    totals = "".join(f"<td><b>{d['totals'].get(s, 0):.2f}</b></td><td></td>" for s in srcs)
+    ladder = ", ".join(f"{trigger.inr(pf['cover_inr'] * f)} at {mm:g} mm" for mm, f in pf["ladder"])
+    links = "".join(f"<li><b>{e(k)}</b>: <a href='{e(v)}' target=_blank>{e(v)}</a></li>"
+                    for k, v in (d.get("sources") or {}).items())
+    pays = "".join(f"<li>{e(x['type'])} &middot; ${x['amount']:.2f} &middot; {e(x['status'])} &middot; <code>{e(x['paypal_id'])}</code>"
+                   + ("".join(f"<br>&nbsp;&nbsp;&rarr; {e(r['name'])} &lt;{e(r['email'])}&gt; ₹{r.get('amount_inr', 0):,}"
+                              for r in (x.get("recipients") or [])) if x.get("recipients") else "") + "</li>"
+                   for x in pf["payments"])
+    outcome = {"PAY": "Payout rule met", "NO_PAY": "Rule not met: no payout", "REVIEW": "Sent to human review"}
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>Proof pack #{pid}</title>
+<style>body{{font-family:system-ui,sans-serif;max-width:900px;margin:32px auto;padding:0 20px;color:#0b1e2a}}
+h1{{margin:0}}.muted{{color:#5b7380}}table{{border-collapse:collapse;width:100%;font-size:14px;margin:12px 0}}
+th,td{{padding:6px 8px;border-bottom:1px solid #dce7ec;text-align:right}}th:first-child,td:first-child{{text-align:left}}
+.m{{color:#5b7380}}.box{{background:#eef6f9;border-left:4px solid #0e4f6e;padding:12px 16px;margin:16px 0}}
+code{{font-size:12px;word-break:break-all}}a{{word-break:break-all}}@media print{{.np{{display:none}}}}</style></head><body>
+<h1>EventRain proof pack</h1><p class=muted>Policy #{pid} &middot; {e(pf['venue'])} ({pf['lat']:.4f}, {pf['lon']:.4f})
+{' &middot; DEMO replay' if d.get('demo_replay') else ''}</p>
+<div class=box><b>Rule:</b> rain in {e(d['window'][0].replace('T', ' '))} &rarr; {e(d['window'][1][11:16])} pays {ladder}.<br>
+<b>Decision:</b> {outcome.get(d['outcome'], d['outcome'])}. {e(d['reason'])}.<br>
+<b>Share of cover earned:</b> {int(d.get('earned_fraction', 1 if d['outcome'] == 'PAY' else 0) * 100)}%
+{f" (+{int(d['disputed_fraction'] * 100)}% under review)" if d.get('disputed_fraction') else ''}
+{f"<br><b>Note:</b> {d['forecast_hours']} of {d['hours']} hours were still in the future; the latest forecast was used." if d.get('forecast_hours') else ''}</div>
+<h2>Hourly rainfall from both independent sources</h2>
+<table><thead><tr><th>Hour</th>{head}</tr></thead><tbody>{''.join(body_rows)}
+<tr><td><b>Total</b></td>{totals}</tr></tbody></table>
+<p class=muted>Two sources may disagree by up to {d['tolerance_mm']:.1f} mm before a person reviews. Spread here: {d['spread_mm']} mm.</p>
+<h2>Check it yourself</h2><ul>{links}</ul>
+<h2>PayPal trail</h2><ul>{pays}</ul>
+<h2>Fingerprint</h2><p>SHA-256 of the evidence: <code>{pf['sha256']}</code></p>
+<p class=np><a href="/api/policies/{pid}/proof.json">Download proof.json</a> &middot; <button onclick="print()">Print / Save as PDF</button></p>
+<p class=muted style="font-size:12px">Generated {e(pf['generated_at'])}. Hackathon prototype, not an insurance product.</p></body></html>"""
+
+
 @app.post("/api/policies/{pid}/check")
 def check_now(pid: int):
     _policy_or_404(pid)
@@ -214,8 +356,8 @@ td:first-child{{color:#5a6b75;width:40%}}.rule{{background:#eef6f9;padding:16px;
 @media print{{button{{display:none}}}}</style></head><body>
 <h1>EventRain Cover</h1><p>Certificate of parametric rain cover &middot; Policy #{pid}{' &middot; DEMO' if p['demo'] else ''}</p>
 <div class="rule"><b>The rule:</b> If total rainfall at {e(p['venue'])} between {start:%I:%M %p} and {end:%I:%M %p}
-on {start:%d %b %Y} is <b>{p['threshold_mm']:g} mm or more</b>, pay <b>{trigger.inr(p['payout_amount'])}</b>
-to {e(p['paypal_email'])} automatically. No claim needed.</div>
+on {start:%d %b %Y} reaches the agreed level, pay <b>{tiers.describe(p.get('payout_mode'), p['threshold_mm'], p['payout_amount'], trigger.inr)}</b>
+automatically, split as: {e(', '.join(f"{x['name']} {x['pct']:g}%" for x in trigger.splits(p)))}. No claim needed.</div>
 <table><tr><td>Organiser</td><td>{e(p['user_name'])}</td></tr><tr><td>Event</td><td>{e(p['event_name'])}</td></tr>
 <tr><td>Location</td><td>{p['lat']:.4f}, {p['lon']:.4f}</td></tr><tr><td>Premium paid</td><td>{trigger.inr(p['premium'])}</td></tr>
 <tr><td>Estimated chance of trigger</td><td>{p['probability']*100:.1f}%</td></tr>
@@ -253,18 +395,21 @@ async def webhook(request: Request):
 @app.get("/api/admin")
 def admin():
     rows = db.all_("""SELECT p.id, p.status, p.threshold_mm, p.payout_amount, p.premium, p.probability, p.demo,
+                             p.payout_mode, p.paid_fraction, p.quote_json,
                              p.decision_json, e.name AS event_name, e.venue, e.start_time, u.name AS user_name
                       FROM policies p JOIN events e ON e.id = p.event_id JOIN users u ON u.id = e.user_id
                       ORDER BY p.id DESC""")
     for r in rows:
         r["decision"] = json.loads(r.pop("decision_json")) if r["decision_json"] else None
-    paid = [r for r in rows if r["status"] != "QUOTED"]
+        q = json.loads(r.pop("quote_json") or "{}")
+        r["expected_fraction"] = q.get("expected_payout_fraction", r["probability"])
+    paid = [r for r in rows if r["status"] not in ("QUOTED", "CANCELLED")]
     return {
         "policies": rows,
         "totals": {
             "premiums_in_inr": sum(r["premium"] for r in paid),
-            "payouts_out_inr": sum(r["payout_amount"] for r in rows if r["status"] in ("PAID", "TRIGGERED")),
-            "expected_payouts_inr": round(sum(r["probability"] * r["payout_amount"] for r in paid)),
+            "payouts_out_inr": round(sum((r["paid_fraction"] or 0) * r["payout_amount"] for r in rows)),
+            "expected_payouts_inr": round(sum(r["expected_fraction"] * r["payout_amount"] for r in paid)),
             "active": sum(r["status"] == "ACTIVE" for r in rows),
             "flagged": sum(r["status"] == "FLAGGED" for r in rows),
         },
@@ -278,11 +423,18 @@ def resolve(pid: int, body: ResolveIn):
     p = _policy_or_404(pid)
     if p["status"] != "FLAGGED":
         raise HTTPException(409, "Only flagged policies need review")
-    if body.decision == "pay":
-        db.set_status(pid, "TRIGGERED", summary=(p["summary"] or "") + " Reviewed: payout approved.")
-        trigger.pay(pid)
+    d = json.loads(p["decision_json"] or "{}")
+    if body.decision == "pay":  # approve the disputed part on top of what was already paid
+        target = (p.get("paid_fraction") or 0) + d.get("disputed_fraction", 1.0)
+        db.set_status(pid, "TRIGGERED", summary=(p["summary"] or "") + " Reviewed: the rest of the payout was approved.")
+        with trigger._check_lock:
+            if trigger.pay_to(pid, min(1.0, target)):
+                db.set_status(pid, "PAID")
     elif body.decision == "reject":
-        db.set_status(pid, "EXPIRED", summary="After review, the rain did not meet the agreed rule. No payout.")
+        if p.get("paid_fraction"):
+            db.set_status(pid, "PAID", summary=(p["summary"] or "") + " Reviewed: only the part both sources confirmed is paid.")
+        else:
+            db.set_status(pid, "EXPIRED", summary="After review, the rain did not meet the agreed rule. No payout.")
     else:
         raise HTTPException(400, "decision must be 'pay' or 'reject'")
     return get_policy(pid)

@@ -66,8 +66,12 @@ class PayPal:
         return {"status": cap["status"], "capture_id": cap["id"], "raw": d}
 
     # ------------------------------------------------------------------ money out
-    def send_payout(self, email: str, amount_usd: float, policy_id: int, note: str) -> dict:
-        """Returns {'batch_id', 'status'} - status PENDING/PROCESSING/SUCCESS."""
+    def send_payout(self, items: list[dict], policy_id: int, note: str) -> dict:
+        """One Payouts batch to one or more people (auto-split).
+
+        items: [{"email": ..., "amount_usd": ..., "name": ...}]
+        Returns {'batch_id', 'status'} - status PENDING/PROCESSING/SUCCESS.
+        """
         if self.mock:
             return {"batch_id": f"MOCK-PAYOUT-{uuid.uuid4().hex[:10].upper()}", "status": "SUCCESS", "raw": {}}
         body = {
@@ -77,16 +81,27 @@ class PayPal:
                 "email_message": note[:1000],
             },
             "items": [{
-                "recipient_type": "EMAIL", "receiver": email, "note": note[:4000],
-                "sender_item_id": f"policy-{policy_id}",
-                "amount": {"value": f"{amount_usd:.2f}", "currency": "USD"},
-            }],
+                "recipient_type": "EMAIL", "receiver": it["email"], "note": note[:4000],
+                "sender_item_id": f"policy-{policy_id}-{i}",
+                "amount": {"value": f"{it['amount_usd']:.2f}", "currency": "USD"},
+            } for i, it in enumerate(items)],
         }
         r = self.http.post("/v1/payments/payouts", json=body, headers=self._auth())
         r.raise_for_status()
         d = r.json()
         return {"batch_id": d["batch_header"]["payout_batch_id"],
                 "status": d["batch_header"]["batch_status"], "raw": d}
+
+    def refund(self, capture_id: str, amount_usd: float, note: str) -> dict:
+        """Refund part of a captured premium (cancellation before the cut-off)."""
+        if self.mock:
+            return {"id": f"MOCK-REFUND-{uuid.uuid4().hex[:10].upper()}", "status": "COMPLETED", "raw": {}}
+        body = {"amount": {"value": f"{amount_usd:.2f}", "currency_code": "USD"}, "note_to_payer": note[:255]}
+        r = self.http.post(f"/v2/payments/captures/{capture_id}/refund", json=body,
+                           headers={**self._auth(), "PayPal-Request-Id": f"refund-{capture_id}"})
+        r.raise_for_status()
+        d = r.json()
+        return {"id": d["id"], "status": d["status"], "raw": d}
 
     def payout_status(self, batch_id: str) -> str:
         if self.mock:

@@ -7,7 +7,7 @@ import { api, inr, pct, type Decision } from "@/lib/api";
 
 type Row = {
   id: number; status: string; threshold_mm: number; payout_amount: number; premium: number; probability: number;
-  demo: number; event_name: string; venue: string; start_time: string; user_name: string; decision: Decision | null;
+  demo: number; payout_mode?: string; paid_fraction?: number; event_name: string; venue: string; start_time: string; user_name: string; decision: Decision | null;
 };
 type ModelRes = { brier: number; auc: number; calibration: { predicted: number; actual: number; n: number }[] };
 type Admin = {
@@ -100,11 +100,11 @@ export default function AdminPage() {
                 <td className="p-3"><Link className="underline" href={`/policy/${r.id}`}>{r.id}</Link></td>
                 <td className="p-3">{r.event_name}{r.demo ? <span className="ml-1 rounded bg-marigold/20 px-1 text-xs">demo</span> : null}<br /><span className="text-xs text-slate">{r.venue}</span></td>
                 <td className="p-3">{r.user_name}</td>
-                <td className="p-3">{r.threshold_mm} mm → {inr(r.payout_amount)}</td>
+                <td className="p-3">{r.payout_mode === "graduated" ? `graduated 5/10/20 mm → ${inr(r.payout_amount)}` : `${r.threshold_mm} mm → ${inr(r.payout_amount)}`}</td>
                 <td className="p-3">{inr(r.premium)}</td>
                 <td className="p-3">{pct(r.probability)}</td>
                 <td className="p-3 text-xs">{r.decision ? Object.entries(r.decision.totals).map(([k, v]) => <div key={k}>{k}: {v} mm</div>) : "-"}</td>
-                <td className="p-3 font-medium">{r.status}</td>
+                <td className="p-3 font-medium">{r.status}{r.paid_fraction ? <span className="block text-xs text-slate">paid {inr(r.paid_fraction * r.payout_amount)}</span> : null}</td>
                 <td className="p-3">
                   {r.status === "FLAGGED" && (
                     <div className="flex gap-2">

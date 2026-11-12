@@ -4,7 +4,7 @@ import dynamic from "next/dynamic";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import { Bar, BarChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { api, inr, pct, type Config, type Quote } from "@/lib/api";
+import { api, inr, pct, type Config, type PayoutMode, type Quote, type Slot, type Split } from "@/lib/api";
 
 const VenueMap = dynamic(() => import("@/components/VenueMap"), {
   ssr: false,
@@ -43,6 +43,9 @@ export default function QuoteForm() {
   const [endH, setEndH] = useState(22);
   const [payout, setPayout] = useState(20000);
   const [threshold, setThreshold] = useState(10);
+  const [mode, setMode] = useState<PayoutMode>("fixed");
+  const [splitOn, setSplitOn] = useState(false);
+  const [splits, setSplits] = useState<Split[]>([]);
   const [quote, setQuote] = useState<Quote | null>(null);
   const [quoting, setQuoting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -61,16 +64,35 @@ export default function QuoteForm() {
 
   const body = useMemo(
     () => ({
-      lat, lon, threshold_mm: threshold, payout_inr: payout, demo, demo_scenario: scenario,
+      lat, lon, threshold_mm: threshold, payout_inr: payout, demo, demo_scenario: scenario, payout_mode: mode,
       start: `${day}T${pad(startH)}:00`, end: `${day}T${pad(endH)}:00`,
     }),
-    [lat, lon, threshold, payout, demo, scenario, day, startH, endH],
+    [lat, lon, threshold, payout, demo, scenario, mode, day, startH, endH],
   );
 
-  const rangeError = endH <= startH ? "The event must end after it starts." : null;
+  const splitTotal = splits.reduce((a, x) => a + (Number(x.pct) || 0), 0);
+  const rangeError = endH <= startH ? "The event must end after it starts."
+    : splitOn && Math.abs(splitTotal - 100) > 0.01 ? `Payout split must add up to 100% (now ${splitTotal}%).` : null;
+
+  const applySlot = (slot: Slot) => {
+    setDay(slot.start.slice(0, 10));
+    setStartH(+slot.start.slice(11, 13));
+    setEndH(+slot.end.slice(11, 13));
+  };
+
+  const toggleSplit = (on: boolean) => {
+    setSplitOn(on);
+    if (on && !splits.length)
+      setSplits([
+        { name: form.name || "Me (organiser)", email: form.paypal_email, pct: 50 },
+        { name: "Caterer", email: "", pct: 30 },
+        { name: "Decorator", email: "", pct: 20 },
+      ]);
+  };
+  const editSplit = (i: number, patch: Partial<Split>) => setSplits(splits.map((x, j) => (j === i ? { ...x, ...patch } : x)));
 
   useEffect(() => {
-    if (rangeError) return;
+    if (endH <= startH) return;
     let cancelled = false;
     const t = setTimeout(() => {
       setQuoting(true);
@@ -83,7 +105,7 @@ export default function QuoteForm() {
       cancelled = true;
       clearTimeout(t);
     };
-  }, [body, rangeError]);
+  }, [body, startH, endH]);
 
   const pickPreset = (name: string) => {
     const v = VENUES.find((x) => x.name === name);
@@ -98,7 +120,9 @@ export default function QuoteForm() {
     e.preventDefault();
     setSubmitting(true);
     try {
-      const { id } = await api<{ id: number }>("/policies", { ...body, venue, ...form });
+      const { id } = await api<{ id: number }>("/policies", {
+        ...body, venue, ...form, splits: splitOn ? splits.map((x) => ({ ...x, pct: Number(x.pct) })) : [],
+      });
       router.push(`/policy/${id}`);
     } catch (err) {
       setError((err as Error).message);
@@ -207,7 +231,29 @@ export default function QuoteForm() {
         </fieldset>
 
         <fieldset>
-          <legend className="mb-2 font-semibold">4. How much rain should trigger the payout?</legend>
+          <legend className="mb-2 font-semibold">4. How should it pay out?</legend>
+          <div className="mb-3 grid grid-cols-2 gap-2" role="radiogroup" aria-label="Payout style">
+            {([
+              ["fixed", "All at once", "The full amount when rain passes one level you choose"],
+              ["graduated", "Graduated", "25% at 5 mm, 50% at 10 mm, 100% at 20 mm. Even a shower helps"],
+            ] as const).map(([value, title, hint]) => (
+              <button key={value} type="button" role="radio" aria-checked={mode === value} onClick={() => setMode(value)}
+                className={`rounded-2xl p-3 text-left ring-1 ${mode === value ? "bg-ink text-mist ring-ink" : "bg-white ring-ink/15 hover:ring-ink/40"}`}>
+                <div className="font-semibold">{title}</div>
+                <div className={`text-xs ${mode === value ? "text-mist/70" : "text-slate"}`}>{hint}</div>
+              </button>
+            ))}
+          </div>
+          {mode === "graduated" ? (
+            <div className="grid grid-cols-3 gap-2 text-center text-sm">
+              {[[5, 0.25], [10, 0.5], [20, 1]].map(([mm, f]) => (
+                <div key={mm} className="rounded-xl bg-mist p-3">
+                  <div className="font-display text-lg font-semibold">{inr(payout * f)}</div>
+                  <div className="text-xs text-slate">at {mm} mm ({f * 100}%)</div>
+                </div>
+              ))}
+            </div>
+          ) : (
           <div className="grid grid-cols-3 gap-2">
             {LEVELS.map((l) => (
               <button key={l.mm} type="button" onClick={() => setThreshold(l.mm)}
@@ -217,6 +263,7 @@ export default function QuoteForm() {
               </button>
             ))}
           </div>
+          )}
           <p className="mt-2 text-xs text-slate">Lower thresholds happen more often, so they cost more.</p>
         </fieldset>
 
@@ -233,6 +280,33 @@ export default function QuoteForm() {
           <input className={input} type="email" placeholder="PayPal email for the payout" value={form.paypal_email}
             onChange={(e) => setForm({ ...form, paypal_email: e.target.value })} required />
           <p className="text-xs text-slate">For the Sandbox, use your sandbox <b>personal</b> account email so you can see the payout arrive.</p>
+
+          <label className="flex cursor-pointer items-center gap-2 pt-2 text-sm font-semibold">
+            <input type="checkbox" checked={splitOn} onChange={(e) => toggleSplit(e.target.checked)} className="h-4 w-4 accent-ink" />
+            Split the payout with my suppliers
+          </label>
+          {splitOn && (
+            <div className="space-y-2 rounded-2xl bg-mist p-3">
+              <p className="text-xs text-slate">One PayPal Payouts batch pays everyone automatically when the rule is met.</p>
+              {splits.map((x, i) => (
+                <div key={i} className="grid grid-cols-[1fr_1.4fr_5rem_auto] items-center gap-2">
+                  <input className={input} placeholder="Name" value={x.name} onChange={(e) => editSplit(i, { name: e.target.value })} required aria-label={`Payee ${i + 1} name`} />
+                  <input className={input} type="email" placeholder="PayPal email" value={x.email} onChange={(e) => editSplit(i, { email: e.target.value })} required aria-label={`Payee ${i + 1} PayPal email`} />
+                  <div className="relative">
+                    <input className={`${input} pr-6`} type="number" min={1} max={100} value={x.pct} onChange={(e) => editSplit(i, { pct: +e.target.value })} aria-label={`Payee ${i + 1} share`} />
+                    <span className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-slate">%</span>
+                  </div>
+                  <button type="button" onClick={() => setSplits(splits.filter((_, j) => j !== i))} disabled={splits.length <= 1}
+                    className="px-2 text-slate hover:text-alert disabled:opacity-30" aria-label={`Remove payee ${i + 1}`}>✕</button>
+                </div>
+              ))}
+              <div className="flex items-center justify-between text-sm">
+                <button type="button" onClick={() => setSplits([...splits, { name: "", email: "", pct: 0 }])} disabled={splits.length >= 5}
+                  className="font-semibold text-ink-3 underline disabled:opacity-40">+ Add payee</button>
+                <span className={Math.abs(splitTotal - 100) > 0.01 ? "font-semibold text-alert" : "text-leaf"}>Total {splitTotal}%</span>
+              </div>
+            </div>
+          )}
         </fieldset>
 
         {(rangeError ?? error) && <p role="alert" className="rounded-xl bg-alert/10 p-3 text-sm text-alert">{rangeError ?? error}</p>}
@@ -244,13 +318,16 @@ export default function QuoteForm() {
       </form>
 
       <aside className="lg:sticky lg:top-6 lg:self-start">
-        <QuotePanel quote={rangeError ? null : quote} quoting={quoting} threshold={threshold} payout={payout} />
+        <QuotePanel quote={endH <= startH ? null : quote} quoting={quoting} threshold={threshold} payout={payout}
+          startH={startH} onPick={applySlot} />
       </aside>
     </div>
   );
 }
 
-function QuotePanel({ quote, quoting, threshold, payout }: { quote: Quote | null; quoting: boolean; threshold: number; payout: number }) {
+function QuotePanel({ quote, quoting, threshold, payout, startH, onPick }: {
+  quote: Quote | null; quoting: boolean; threshold: number; payout: number; startH: number; onPick: (s: Slot) => void;
+}) {
   if (!quote)
     return (
       <div className="rounded-3xl bg-ink p-8 text-mist">
@@ -258,11 +335,17 @@ function QuotePanel({ quote, quoting, threshold, payout }: { quote: Quote | null
       </div>
     );
   const s = quote.signals;
+  const graduated = quote.payout_mode === "graduated";
+  const shownTh = graduated ? 5 : threshold;
+  const fmtSlot = (iso: string, end: string) =>
+    `${new Date(iso).toLocaleDateString("en-IN", { weekday: "short", day: "numeric", month: "short" })}, ` +
+    `${+iso.slice(11, 13) % 12 || 12}${+iso.slice(11, 13) < 12 ? " AM" : " PM"}–${+end.slice(11, 13) % 12 || 12}${+end.slice(11, 13) < 12 ? " AM" : " PM"}`;
+  const maxRisk = Math.max(...(quote.hourly_risk ?? []).map((h) => h.probability), 0.01);
   return (
     <div className={`space-y-5 rounded-3xl bg-ink p-7 text-mist transition-opacity ${quoting ? "opacity-60" : ""}`}>
       <div className="flex items-end justify-between gap-4">
         <div>
-          <p className="text-xs uppercase tracking-widest text-mist/60">Chance of {threshold}+ mm in your window</p>
+          <p className="text-xs uppercase tracking-widest text-mist/60">{graduated ? "Chance of any payout" : `Chance of ${threshold}+ mm in your window`}</p>
           <p className="font-display text-6xl font-semibold text-rain">{pct(quote.probability)}</p>
         </div>
         <div className="text-right">
@@ -272,13 +355,55 @@ function QuotePanel({ quote, quoting, threshold, payout }: { quote: Quote | null
         </div>
       </div>
 
-      <p className="rounded-2xl bg-ink-2 p-4 text-sm leading-relaxed">
-        Pay <b>{inr(quote.premium_inr)}</b>. If <b>{threshold} mm</b> or more rain falls, you get <b>{inr(payout)}</b>{" "}
-        automatically. If the weather is fine, enjoy your event.
-      </p>
+      {graduated ? (
+        <div className="rounded-2xl bg-ink-2 p-4 text-sm">
+          <p className="mb-2">Pay <b>{inr(quote.premium_inr)}</b>. The more it rains, the more you get, automatically:</p>
+          {quote.tiers.map((t) => (
+            <Row key={t.mm} k={`${t.mm}+ mm → ${inr(payout * t.fraction)}`} v={`${pct(t.probability ?? 0)} chance`} />
+          ))}
+        </div>
+      ) : (
+        <p className="rounded-2xl bg-ink-2 p-4 text-sm leading-relaxed">
+          Pay <b>{inr(quote.premium_inr)}</b>. If <b>{threshold} mm</b> or more rain falls, you get <b>{inr(payout)}</b>{" "}
+          automatically. If the weather is fine, enjoy your event.
+        </p>
+      )}
+
+      {!!quote.suggestions?.length && (
+        <div className="rounded-2xl border border-marigold/40 bg-marigold/10 p-4 text-sm">
+          <p className="mb-2 font-semibold text-marigold">✨ AI reschedule suggestions: lower rain risk nearby</p>
+          <div className="space-y-2">
+            {quote.suggestions.map((o) => (
+              <button key={o.start} type="button" onClick={() => onPick(o)}
+                className="flex w-full items-center justify-between gap-3 rounded-xl bg-ink-2 px-3 py-2 text-left hover:bg-ink-3">
+                <span>{fmtSlot(o.start, o.end)}<span className="block text-xs text-mist/60">{pct(o.probability)} risk · {inr(o.premium_inr)}</span></span>
+                <span className="shrink-0 rounded-full bg-leaf px-2 py-0.5 text-xs font-semibold text-white">save {inr(o.saving_inr)}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {!!quote.hourly_risk?.length && (
+        <div>
+          <p className="mb-2 text-sm font-semibold">Rain risk by start time (same day, same length)</p>
+          <div className="flex h-16 items-end gap-1" role="list">
+            {quote.hourly_risk.map((h) => (
+              <button key={h.hour} type="button" role="listitem" onClick={() => onPick(h)}
+                title={`${h.hour}:00 start: ${pct(h.probability)} risk, ${inr(h.premium_inr)}`}
+                aria-label={`Start at ${h.hour}:00, ${pct(h.probability)} risk, ${inr(h.premium_inr)}`}
+                className={`flex-1 rounded-t ${h.hour === startH ? "bg-marigold" : "bg-rain/60 hover:bg-rain"}`}
+                style={{ height: `${Math.max(8, (h.probability / maxRisk) * 100)}%` }} />
+            ))}
+          </div>
+          <div className="mt-1 flex justify-between text-[10px] text-mist/50">
+            <span>{quote.hourly_risk[0].hour}:00</span><span>tap a bar to switch</span><span>{quote.hourly_risk.at(-1)!.hour}:00</span>
+          </div>
+        </div>
+      )}
 
       <div className="space-y-1.5 text-sm">
-        <Row k={`Expected loss (${pct(quote.probability)} × ${inr(payout)})`} v={inr(quote.breakdown.expected_loss_inr)} />
+        <Row k={graduated ? `Expected payout (${pct(quote.expected_payout_fraction)} of ${inr(payout)})` : `Expected loss (${pct(quote.probability)} × ${inr(payout)})`} v={inr(quote.breakdown.expected_loss_inr)} />
         <Row k={`Safety margin (${quote.breakdown.margin_pct}%)`} v={inr(quote.breakdown.margin_inr)} />
         <Row k="Platform fee" v={inr(quote.breakdown.platform_fee_inr)} />
         <div className="border-t border-mist/15 pt-1.5"><Row k="Premium" v={inr(quote.premium_inr)} bold /></div>
@@ -293,7 +418,7 @@ function QuotePanel({ quote, quoting, threshold, payout }: { quote: Quote | null
         ) : (
           <p className="text-mist/60">Live forecast kicks in within 14 days of the event.</p>
         )}
-        <Row k={`Days with ${threshold}+ mm near this date (local)`} v={pct(s.local_base_rate)} />
+        <Row k={`Days with ${shownTh}+ mm near this date (local)`} v={pct(s.local_base_rate)} />
       </div>
 
       <div>
@@ -304,7 +429,7 @@ function QuotePanel({ quote, quoting, threshold, payout }: { quote: Quote | null
               <XAxis dataKey="year" tick={{ fill: "#e8f1f4aa", fontSize: 10 }} tickFormatter={(y) => `'${String(y).slice(2)}`} />
               <YAxis tick={{ fill: "#e8f1f4aa", fontSize: 10 }} />
               <Tooltip formatter={(v) => [`${v} mm`, "Rain"]} contentStyle={{ background: "#12303f", border: 0, borderRadius: 8 }} labelStyle={{ color: "#e8f1f4" }} />
-              <ReferenceLine y={threshold} stroke="#f2a93b" strokeDasharray="4 3" />
+              <ReferenceLine y={shownTh} stroke="#f2a93b" strokeDasharray="4 3" />
               <Bar dataKey="rain_mm" fill="#5cc2e6" radius={[3, 3, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>

@@ -36,6 +36,14 @@ CREATE TABLE IF NOT EXISTS payments (
 """
 
 
+MIGRATIONS = [
+    ("demo_scenario", "TEXT DEFAULT 'rain'"),   # rain / dry / live demo replay
+    ("payout_mode", "TEXT DEFAULT 'fixed'"),    # fixed / graduated
+    ("splits_json", "TEXT"),                    # [{name, email, pct}] payees
+    ("paid_fraction", "REAL DEFAULT 0"),        # share of cover paid out so far
+]
+
+
 def now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -55,8 +63,9 @@ def init():
     with conn() as c:
         c.executescript(SCHEMA)
         cols = [r["name"] for r in c.execute("PRAGMA table_info(policies)")]
-        if "demo_scenario" not in cols:  # databases created before the dry scenario existed
-            c.execute("ALTER TABLE policies ADD COLUMN demo_scenario TEXT DEFAULT 'rain'")
+        for name, ddl in MIGRATIONS:  # columns added after the first release
+            if name not in cols:
+                c.execute(f"ALTER TABLE policies ADD COLUMN {name} {ddl}")
 
 
 def one(sql: str, *args) -> dict | None:

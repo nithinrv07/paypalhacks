@@ -7,7 +7,7 @@ import threading
 import time
 from datetime import date, datetime, timedelta
 
-from . import config, db, weather
+from . import config, db, tiers, weather
 from .paypal import paypal
 
 
@@ -107,7 +107,9 @@ def live(p: dict) -> dict:
         return {"mode": "demo", "started": True, "finished": frac >= 1, "progress": round(frac, 3),
                 "replay_date": replay_date(p), "scenario": p.get("demo_scenario") or "rain", "clock": clock.strftime("%H:%M"),
                 "rain_so_far": round(total, 2), "threshold_mm": th, "series": series,
-                "forecast_hours": sum(is_forecast(r["timestamp"], started) for r in rows)}
+                "forecast_hours": sum(is_forecast(r["timestamp"], started) for r in rows),
+                "alerts": alerts(p, series, [r for i, r in enumerate(rows)
+                                             if i >= hours and is_forecast(r["timestamp"], started)])}
 
     now = datetime.now()
     if now < w0:
@@ -122,7 +124,34 @@ def live(p: dict) -> dict:
         total += r["rain_mm"]
         series.append({"time": r["time"][11:16], "rain_mm": r["rain_mm"], "cumulative": round(total, 2)})
     return {"mode": "live", "started": True, "finished": now >= w1, "rain_so_far": round(total, 2),
-            "threshold_mm": th, "series": series}
+            "threshold_mm": th, "series": series, "alerts": alerts(p, series, [])}
+
+
+def alerts(p: dict, series: list[dict], upcoming: list[dict]) -> list[dict]:
+    """Live rain alerts for the organiser, in the order they happened.
+    Each has a stable id so the page can pop a toast only once."""
+    steps = tiers.ladder(p.get("payout_mode"), p["threshold_mm"])
+    graduated = p.get("payout_mode") == "graduated"
+    first = steps[0][0]
+    levels = [(0.5 * first, "info", f"Halfway there: {0.5 * first:g} mm so far, payouts start at {first:g} mm"),
+              (0.8 * first, "warn", f"Getting close: {0.8 * first:g} mm so far, payout line is {first:g} mm")]
+    for mm, frac in steps:
+        levels.append((mm, "trigger", f"{mm:g} mm reached: {int(frac * 100)}% of your cover is now due" if graduated
+                       else f"Threshold crossed: {mm:g} mm, your payout rule is met"))
+    out = []
+    for lvl, kind, text in levels:
+        hit = next((x for x in series if x["cumulative"] >= lvl), None)
+        if hit:
+            out.append({"id": f"level-{lvl:g}", "time": hit["time"], "kind": kind, "text": text})
+    for x in series:
+        if x["rain_mm"] >= 6:
+            out.append({"id": f"burst-{x['time']}", "time": x["time"], "kind": "warn",
+                        "text": f"Heavy burst: {x['rain_mm']:.1f} mm in the hour from {x['time']}"})
+    coming = round(sum(r["rain_mm"] for r in upcoming), 1)
+    if coming >= 1:
+        out.append({"id": "forecast", "time": upcoming[0]["timestamp"][11:16], "kind": "info",
+                    "text": f"Forecast: about {coming} mm more expected in the hours still to come"})
+    return sorted(out, key=lambda a: a["time"])
 
 
 def start_replay(policy_id: int):
@@ -166,66 +195,121 @@ def _check(policy_id: int, force: bool = False) -> dict:
 
     totals = {src: round(sum(r["rain_mm"] for r in rows), 2) for src, rows in obs.items()}
     vals = list(totals.values())
-    met = [v >= th for v in vals]
-    tolerance = max(2.0, 0.3 * th)  # how far apart the two sources may be
+    steps = tiers.ladder(p.get("payout_mode"), th)
+    fracs = [tiers.fraction(v, steps) for v in vals]
+    ref_mm = 10.0 if p.get("payout_mode") == "graduated" else th
+    tolerance = max(2.0, 0.3 * ref_mm)  # how far apart the two sources may be
     spread = round(max(vals) - min(vals), 2)
-    if all(met) or not any(met):
-        outcome, reason = ("PAY" if all(met) else "NO_PAY"), "Both sources agree"
+    mean = sum(vals) / len(vals)
+    disputed = 0.0
+    if min(fracs) == max(fracs):
+        earned, reason = fracs[0], "Both sources agree"
     elif spread <= tolerance:
-        mean = sum(vals) / len(vals)
-        outcome = "PAY" if mean >= th else "NO_PAY"
+        earned = tiers.fraction(mean, steps)
         reason = f"Sources differ slightly ({spread} mm); decided on the average ({mean:.1f} mm)"
     else:
-        outcome, reason = "REVIEW", f"Sources disagree by {spread} mm (> {tolerance:.1f} mm): flagged for human review"
+        # Pay what both sources confirm now; only the disputed part goes to review
+        earned, disputed = min(fracs), max(fracs) - min(fracs)
+        reason = (f"Sources disagree by {spread} mm (> {tolerance:.1f} mm). Both confirm "
+                  f"{int(earned * 100)}% of the cover, paid now; the extra {int(disputed * 100)}% is under human review")
+    outcome = "REVIEW" if disputed else ("PAY" if earned > 0 else "NO_PAY")
 
-    rain = round(sum(vals) / len(vals), 1)
+    rain = round(mean, 1)
     checked_at = datetime.fromisoformat(p["replay_started_at"]) if p.get("replay_started_at") else datetime.now()
     hours_in_window = obs[next(iter(obs))]
     forecast_hours = sum(is_forecast(r["time"], checked_at) for r in hours_in_window)
     fc_note = (f" Note: {forecast_hours} of the {len(hours_in_window)} hours had not happened yet, so the latest "
                f"forecast was used for them.") if forecast_hours else ""
-    hourly = obs[next(iter(obs))]
-    peak = max(hourly, key=lambda r: r["rain_mm"]) if hourly else None
+    peak = max(hours_in_window, key=lambda r: r["rain_mm"]) if hours_in_window else None
     decision = {"totals": totals, "threshold_mm": th, "outcome": outcome, "reason": reason,
                 "spread_mm": spread, "tolerance_mm": tolerance, "window": [w0.isoformat(), w1.isoformat()],
                 "checked_at": db.now(), "demo_replay": bool(p["demo"]),
-                "forecast_hours": forecast_hours, "hours": len(hours_in_window)}
+                "forecast_hours": forecast_hours, "hours": len(hours_in_window),
+                "payout_mode": p.get("payout_mode") or "fixed", "ladder": steps,
+                "source_fractions": dict(zip(totals, fracs)), "earned_fraction": earned,
+                "disputed_fraction": disputed, "sources": weather.source_links(p["lat"], p["lon"], w0, w1)}
 
+    when = f"between {w0.strftime('%I %p').lstrip('0')} and {w1.strftime('%I %p').lstrip('0')}"
+    peak_txt = f" (peak {peak['rain_mm']} mm around {peak['time'][11:16]})" if peak and peak["rain_mm"] > 0 else ""
+    amount = earned * p["payout_amount"]
+    who = split_text(p, amount)
     if outcome == "PAY":
-        summary = (f"It rained {rain} mm at {p['venue']} between {w0.strftime('%I %p').lstrip('0')} and {w1.strftime('%I %p').lstrip('0')}"
-                   f"{' (peak ' + str(peak['rain_mm']) + ' mm around ' + peak['time'][11:16] + ')' if peak else ''}. "
-                   f"Your threshold was {th:g} mm, so {inr(p['payout_amount'])} has been sent to your PayPal "
-                   f"({p['paypal_email']}). No claim needed.{fc_note}")
+        rule = (f"Your graduated cover pays {int(earned * 100)}% at this level" if p.get("payout_mode") == "graduated"
+                else f"Your threshold was {th:g} mm")
+        summary = (f"It rained {rain} mm at {p['venue']} {when}{peak_txt}. {rule}, so {inr(amount)} has been sent "
+                   f"via PayPal{who}. No claim needed.{fc_note}")
         db.set_status(policy_id, "TRIGGERED", decision_json=json.dumps(decision), summary=summary)
-        pay(policy_id)
+        if pay_to(policy_id, earned):
+            db.set_status(policy_id, "PAID")
     elif outcome == "NO_PAY":
+        lowest = steps[0][0]
         summary = (f"Good weather! Only {rain} mm of rain fell at {p['venue']} during your event "
-                   f"(threshold {th:g} mm), so no payout was needed. We hope the event went well.{fc_note}")
+                   f"(payout starts at {lowest:g} mm), so no payout was needed. We hope the event went well.{fc_note}")
         db.set_status(policy_id, "EXPIRED", decision_json=json.dumps(decision), summary=summary)
     else:
-        summary = ("The two weather sources disagree about how much rain fell, so a person is double-checking. "
-                   "You don't need to do anything.")
+        part = (f" Both sources confirm {int(earned * 100)}% of your cover, so {inr(amount)} has been sent via PayPal"
+                f"{who} right away.") if earned else ""
+        summary = (f"The two weather sources disagree about how much rain fell ({spread} mm apart).{part} "
+                   f"A person is double-checking the rest. You don't need to do anything.")
         db.set_status(policy_id, "FLAGGED", decision_json=json.dumps(decision), summary=summary)
+        if earned:
+            pay_to(policy_id, earned)
     return {"status": load(policy_id)["status"], "decision": decision, "summary": summary}
 
 
-def pay(policy_id: int):
+# ----------------------------------------------------------------- payouts
+def splits(p: dict) -> list[dict]:
+    """Payees and their % share. Defaults to the organiser getting everything."""
+    try:
+        s = json.loads(p.get("splits_json") or "[]")
+    except ValueError:
+        s = []
+    return s or [{"name": p["user_name"], "email": p["paypal_email"], "pct": 100.0}]
+
+
+def split_amounts(p: dict, amount_inr: float) -> list[dict]:
+    """Divide an amount between payees; the last payee absorbs rounding."""
+    s = splits(p)
+    out, left = [], round(amount_inr)
+    for i, x in enumerate(s):
+        part = left if i == len(s) - 1 else round(amount_inr * x["pct"] / 100)
+        left -= part
+        out.append({**x, "amount_inr": part})
+    return out
+
+
+def split_text(p: dict, amount_inr: float) -> str:
+    parts = split_amounts(p, amount_inr)
+    if len(parts) == 1:
+        return f" to {parts[0]['email']}"
+    return ", split automatically: " + ", ".join(f"{x['name']} {inr(x['amount_inr'])}" for x in parts)
+
+
+def pay_to(policy_id: int, target_fraction: float) -> bool:
+    """Pay out until `target_fraction` of the cover has been paid. Safe to call
+    again: only the difference is ever sent. Returns True when PayPal confirms."""
     p = load(policy_id)
-    if db.one("SELECT id FROM payments WHERE policy_id = ? AND type = 'PAYOUT'", policy_id):
-        return  # idempotent: never pay twice
-    usd = round(p["payout_amount"] / config.INR_PER_USD, 2)
+    delta = round(target_fraction - (p.get("paid_fraction") or 0.0), 4)
+    if delta <= 0:
+        return True
+    amount_inr = delta * p["payout_amount"]
+    parts = split_amounts(p, amount_inr)
+    items = [{"email": x["email"], "name": x["name"], "amount_usd": round(x["amount_inr"] / config.INR_PER_USD, 2)}
+             for x in parts if x["amount_inr"] > 0]
+    usd = round(sum(i["amount_usd"] for i in items), 2)
     note = p["summary"] or f"EventRain Cover payout for {p['event_name']}"
     try:
-        res = paypal.send_payout(p["paypal_email"], usd, policy_id, note)
-    except Exception as e:  # keep TRIGGERED so the loop/admin can retry
+        res = paypal.send_payout(items, policy_id, note)
+    except Exception as e:  # keep the status so the loop/admin can retry
         db.run("INSERT INTO payments (policy_id, type, paypal_id, amount, currency, status, raw, created_at) "
                "VALUES (?,?,?,?,?,?,?,?)", policy_id, "PAYOUT_ERROR", None, usd, "USD", "FAILED", str(e), db.now())
-        return
+        return False
     db.run("INSERT INTO payments (policy_id, type, paypal_id, amount, currency, status, raw, created_at) "
            "VALUES (?,?,?,?,?,?,?,?)", policy_id, "PAYOUT", res["batch_id"], usd, "USD", res["status"],
-           json.dumps(res.get("raw", {})), db.now())
-    if res["status"] == "SUCCESS":
-        db.set_status(policy_id, "PAID")
+           json.dumps({"items": [{**i, "amount_inr": x["amount_inr"]} for i, x in zip(items, parts)],
+                       "fraction": delta, "paypal": res.get("raw", {})}), db.now())
+    db.run("UPDATE policies SET paid_fraction = ?, updated_at = ? WHERE id = ?", target_fraction, db.now(), policy_id)
+    return res["status"] == "SUCCESS"
 
 
 def refresh_payouts():

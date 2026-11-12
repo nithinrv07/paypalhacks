@@ -112,6 +112,22 @@ def _series(url: str, lat: float, lon: float, day0: str, day1: str, model: str) 
     return {t: (p or 0.0) for t, p in zip(d["hourly"]["time"], d["hourly"]["precipitation"])}
 
 
+def _source_plan(end: datetime) -> dict[str, tuple[str, str]]:
+    """Which API and model each of the two witnesses uses for this window."""
+    if (date.today() - end.date()).days < 6:  # ERA5 lags ~5 days: use the live analysis
+        return {"ECMWF IFS (live)": (FORECAST, "ecmwf_ifs025"), "NOAA GFS (live)": (FORECAST, "gfs_seamless")}
+    return {"ECMWF ERA5": (ARCHIVE, "era5"), "NOAA GFS": (HIST_FORECAST, "gfs_seamless")}
+
+
+def source_links(lat: float, lon: float, start: datetime, end: datetime) -> dict[str, str]:
+    """Exact public URLs anyone can open to re-check the rainfall we used."""
+    day0, day1 = start.date().isoformat(), end.date().isoformat()
+    return {name: str(httpx.URL(url, params={"latitude": lat, "longitude": lon, "start_date": day0,
+                                             "end_date": day1, "hourly": "precipitation", "models": model,
+                                             "timezone": TZ}))
+            for name, (url, model) in _source_plan(end).items()}
+
+
 def observed_hourly(lat: float, lon: float, start: datetime, end: datetime) -> dict[str, list[dict]]:
     """Hourly rain in [start, end) from two independent sources ("two witnesses").
 
@@ -121,14 +137,8 @@ def observed_hourly(lat: float, lon: float, start: datetime, end: datetime) -> d
               agency and model, so the two are genuinely independent.
     """
     day0, day1 = start.date().isoformat(), end.date().isoformat()
-    recent = (date.today() - end.date()).days < 6
-    plan = {  # recent hours come from the live forecast API's latest analysis
-        "ECMWF ERA5": (ARCHIVE, "era5"), "NOAA GFS": (HIST_FORECAST, "gfs_seamless"),
-    } if not recent else {
-        "ECMWF IFS (live)": (FORECAST, "ecmwf_ifs025"), "NOAA GFS (live)": (FORECAST, "gfs_seamless"),
-    }
     out: dict[str, list[dict]] = {}
-    for name, (url, model) in plan.items():
+    for name, (url, model) in _source_plan(end).items():
         try:
             series = _series(url, lat, lon, day0, day1, model)
         except httpx.HTTPError:
